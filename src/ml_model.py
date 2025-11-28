@@ -2,68 +2,156 @@
 import pandas as pd
 import numpy as np
 import os
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
 import joblib
-from sklearn.preprocessing import LabelEncoder # Needed if you have other object columns not handled by prepare_features
+import shap
+import matplotlib.pyplot as plt
 
-def prepare_features(df_input): # Renamed to avoid confusion with internal df
-    df = df_input.copy() # Work on a copy to avoid modifying the original df
-    # Select features
-    X = df[['Age','MonthlyIncome','YearsAtCompany','JobSatisfaction','EnvironmentSatisfaction','TrainingTimesLastYear']]
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    classification_report, roc_auc_score, confusion_matrix
+)
+from xgboost import XGBClassifier
 
-    # If OverTime is present, add OverTimeFlag
+# ---------------------------------------------------
+# FEATURE PREPARATION
+# ---------------------------------------------------
+def prepare_features(df_input):
+    """
+    Cleans & encodes features consistently for both
+    training and prediction.
+    """
+    df = df_input.copy()
+
+    # Core numeric features
+    cols = [
+        'Age', 'MonthlyIncome', 'YearsAtCompany',
+        'JobSatisfaction', 'EnvironmentSatisfaction',
+        'TrainingTimesLastYear'
+    ]
+
+    X = df[cols].copy()
+
+    # OverTime flag handling
     if 'OverTime' in df.columns:
-        X['OverTimeFlag'] = df['OverTime'].apply(lambda x: 1 if str(x).strip().lower()=='yes' else 0)
+        X['OverTimeFlag'] = df['OverTime'].str.lower().eq("yes").astype(int)
     else:
-        # If OverTime is not in the dataframe, and the model was trained with OverTimeFlag,
-        # you need to decide how to handle this. For now, let's assume it's set to 0.
-        # This needs to be consistent with how missing 'OverTime' was handled in training data.
-        if 'OverTimeFlag' in clf.feature_names_in_: # If the model expects it, but data doesn't have source
-            X['OverTimeFlag'] = 0 # Or some default value.
-            # This logic needs to be robust, ideally ensuring all needed raw columns are present.
+        # Default to 0 if missing
+        X['OverTimeFlag'] = 0
+
+    # Handle missing values
+    return X.fillna(0)
 
 
-    # Fill NaNs in the selected features
-    X = X.fillna(0) # Ensure consistency with training
-    return X
-
-def train_random_forest(data_path="data/ibm_hr_attrition.csv", model_out="outputs/rf_attrition.joblib"):
+# ---------------------------------------------------
+# MODEL TRAINING WRAPPER
+# ---------------------------------------------------
+def train_models(data_path="data/ibm_hr_attrition.csv"):
     df = pd.read_csv(data_path)
 
-    # Encode 'Attrition' to 'AttritionFlag' for the target variable
+    # Encode target
     df['AttritionFlag'] = df['Attrition'].map({'Yes': 1, 'No': 0})
 
-    # Prepare features using the defined function
     X = prepare_features(df)
-    y = df['AttritionFlag'] # Ensure this target column exists
+    y = df['AttritionFlag']
 
-    # Train-test split
-    # Using stratify=y is good for imbalanced datasets like attrition
-    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.25, random_state=42)
+    # Split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, stratify=y, random_state=42
+    )
 
-    # Train Random Forest classifier
-    clf = RandomForestClassifier(n_estimators=200, random_state=42)
-    clf.fit(X_train, y_train)
+    # ---------------------------------------------------
+    # Define candidate models
+    # ---------------------------------------------------
+    models = {
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+        "LogisticRegression": LogisticRegression(max_iter=500),
+        "GradientBoosting": GradientBoostingClassifier(),
+        "XGBoost": XGBClassifier(
+            eval_metric="logloss",
+            learning_rate=0.05,
+            max_depth=5,
+            n_estimators=250
+        )
+    }
 
-    # Evaluate (optional, but good for understanding model performance)
-    y_pred = clf.predict(X_test)
-    y_proba = clf.predict_proba(X_test)[:,1]
-    report = classification_report(y_test, y_pred, output_dict=True)
-    auc = roc_auc_score(y_test, y_proba)
-    cm = confusion_matrix(y_test, y_pred)
+    results = {}
+    best_model = None
+    best_auc = -1
 
-    # Save the trained model
-    joblib.dump(clf, model_out)
-    print(f"✅ Model saved to {model_out}")
-    print("Classification Report:\n", classification_report(y_test, y_pred))
-    print(f"ROC AUC Score: {auc:.2f}")
+    # ---------------------------------------------------
+    # Train & evaluate all models
+    # ---------------------------------------------------
+    for name, model in models.items():
+        print(f"\n🔹 Training {name}...")
 
-    return clf, report, auc, cm
+        model.fit(X_train, y_train)
 
-# Example of how to run this script (e.g., in a notebook or directly)
-if __name__ == "__main__":
-    # Ensure the outputs directory exists
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1]
+
+        auc = roc_auc_score(y_test, y_proba)
+        report = classification_report(y_test, y_pred, output_dict=True)
+        cm = confusion_matrix(y_test, y_pred)
+
+        results[name] = {
+            "model": model,
+            "auc": auc,
+            "report": report,
+            "confusion_matrix": cm
+        }
+
+        print(f"{name} ROC–AUC: {auc:.4f}")
+
+        # Keep best model
+        if auc > best_auc:
+            best_auc = auc
+            best_model = model
+            best_name = name
+
+    print(f"\n🏆 Best Model Selected: **{best_name}** with AUC={best_auc:.4f}")
+
+    # ---------------------------------------------------
+    # Save model
+    # ---------------------------------------------------
     os.makedirs("outputs", exist_ok=True)
-    train_random_forest()
+    joblib.dump(best_model, "outputs/best_model.joblib")
+    print("✅ Saved best model → outputs/best_model.joblib")
+
+    # ---------------------------------------------------
+    # SHAP EXPLAINABILITY
+    # ---------------------------------------------------
+    print("\n📌 Generating SHAP explainability plots...")
+
+    explainer = shap.Explainer(best_model, X_train)
+    shap_values = explainer(X_train)
+
+    # SHAP summary plot
+    plt.figure(figsize=(9, 6))
+    shap.summary_plot(shap_values, X_train, show=False)
+    plt.tight_layout()
+    plt.savefig("outputs/shap_summary.png")
+    plt.close()
+
+    print("📊 SHAP summary saved → outputs/shap_summary.png")
+
+    # Feature importance (model-based)
+    if hasattr(best_model, "feature_importances_"):
+        plt.figure(figsize=(8, 5))
+        plt.barh(X_train.columns, best_model.feature_importances_)
+        plt.title("Feature Importance")
+        plt.tight_layout()
+        plt.savefig("outputs/feature_importance.png")
+        plt.close()
+
+        print("📊 Feature importance saved → outputs/feature_importance.png")
+
+    return best_model, results
+
+
+# ---------------------------------------------------
+# SCRIPT ENTRY POINT
+# ---------------------------------------------------
+if __name__ == "__main__":
+    train_models()
